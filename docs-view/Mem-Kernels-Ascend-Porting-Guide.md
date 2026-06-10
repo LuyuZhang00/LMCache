@@ -1429,7 +1429,202 @@ paged_buffer_ptr = paged_buffer_ptrs[3]  // 第 3 层的 KV 缓冲区
   ... 每个线程处理 8 个 xword (1024/128=8)
 ```
 
-#### A.6.8 `get_kernel_ptr`——主机/设备指针统一（第 467-484 行）
+#### A.6.8 `key_value` 的连续内存布局：到底有多长？
+
+这是一个关键问题：`key_value` 张量的连续内存**不是整个模型的 KV Cache**，而是**一个 chunk（默认 256 tokens）的 KV Cache**。
+
+##### 核心结论
+
+```
+key_value 不是 [2, NL, 整个序列长度, H]
+而是     [2, NL, chunk_size, H]    ← 通常 chunk_size = 256
+```
+
+**LMCache 的设计哲学是"分块管理"**：将长序列切分为固定大小的 chunk，每个 chunk 独立分配、独立存储、独立传输。
+
+##### 从代码追踪 `key_value` 的分配过程
+
+**Step 1：TokenDatabase 将序列切分为 chunk**
+
+```python
+# cache_engine.py 第 461-470 行
+for start, end, key in self.token_database.process_tokens(tokens, mask, ...):
+    num_tokens = end - start  # 通常 = chunk_size = 256
+```
+
+`ChunkedTokenDatabase` 按 `chunk_size`（默认 256）将 token 序列切分：
+```
+输入: tokens[0:1024]
+输出: chunk_0 = tokens[0:256], chunk_1 = tokens[256:512], ...
+      每个 chunk 的 num_tokens = 256
+```
+
+**Step 2：根据 num_tokens 计算形状**
+
+```python
+# metadata.py 第 84-112 行
+def get_shapes(self, num_tokens):
+    return [torch.Size([
+        self.kv_shape[1],                    # kv_size: 2 (K+V) 或 1 (MLA)
+        self.kv_shape[0],                    # num_layers: 例如 32
+        num_tokens,                          # chunk_size: 例如 256
+        self.kv_shape[3] * self.kv_shape[4], # hidden_dim: NH * HS
+    ])]
+```
+
+**Step 3：分配 MemoryObj**
+
+```python
+# cache_engine.py 第 475-482 行
+memory_obj = self.storage_manager.allocate(kv_shapes, kv_dtypes, fmt=self.fmt)
+```
+
+分配器从预分配的钉扎 CPU 内存池中切出一块连续内存，形状为 `[2, NL, chunk_size, H]`。
+
+**Step 4：传入 CUDA 内核**
+
+```python
+# gpu_connectors.py 第 316 行
+lmc_ops.multi_layer_kv_transfer(
+    memory_obj.tensor,  # shape = [2, NL, chunk_size, H]，例如 [2, 32, 256, 4096]
+    ...
+)
+```
+
+##### 各模型的具体内存大小
+
+| 模型 | NL | NH | HS | H | dtype | chunk_size | key_value 形状 | 内存大小 |
+|------|----|----|----|----|-------|-----------|---------------|---------|
+| Llama-7B | 32 | 32 | 128 | 4096 | fp16 | 256 | [2, 32, 256, 4096] | **128 MB** |
+| Llama-13B | 40 | 40 | 128 | 5120 | fp16 | 256 | [2, 40, 256, 5120] | **200 MB** |
+| Llama-70B | 80 | 64 | 128 | 8192 | fp16 | 256 | [2, 80, 256, 8192] | **640 MB** |
+| DeepSeek-V3 (MLA) | 61 | 1 | 512 | 512 | fp16 | 256 | [1, 61, 256, 512] | **15.6 MB** |
+| Llama-7B | 32 | 32 | 128 | 4096 | fp16 | 128 | [2, 32, 128, 4096] | **64 MB** |
+
+**计算公式**：
+```
+内存大小 = kv_size × NL × chunk_size × H × dtype_size
+         = 2 × 32 × 256 × 4096 × 2 字节
+         = 128 MB (Llama-7B)
+```
+
+##### 为什么是 chunk 而不是整个序列？
+
+**原因 1：内存效率**
+- 整个序列的 KV Cache 可能非常大（128K tokens × 4096 hidden × 2 bytes × 32 layers × 2 = 64 GB）
+- 一次性分配 64 GB 连续内存不现实
+- 分块后每块只需 128 MB，可以灵活分配和释放
+
+**原因 2：缓存粒度**
+- 不同 chunk 可以独立缓存、独立淘汰
+- 前缀匹配在 chunk 粒度进行
+- 部分命中时只需传输命中的 chunk
+
+**原因 3：逐层流水线**
+- layerwise 模式下，每层只需一个 chunk 的缓冲区
+- 峰值内存从 32 × 128 MB = 4 GB 降到 1 × 128 MB = 128 MB
+
+##### 内存布局的物理视图
+
+以 Llama-7B fp16 为例，`key_value` 张量的物理内存布局：
+
+```
+key_value = [2, 32, 256, 4096] fp16
+总大小 = 2 × 32 × 256 × 4096 × 2 字节 = 128 MB
+
+物理内存（行优先连续排列）：
+┌──────────────────────────────────────────────────────────┐
+│ Key (k_or_v=0): 64 MB                                    │
+│ ├── Layer 0:  256 tokens × 4096 elements × 2B = 2 MB     │
+│ │   ├── Token 0:   4096 elements × 2B = 8 KB             │
+│ │   ├── Token 1:   4096 elements × 2B = 8 KB             │
+│ │   ├── ...                                               │
+│ │   └── Token 255: 4096 elements × 2B = 8 KB             │
+│ ├── Layer 1:  2 MB                                       │
+│ ├── ...                                                   │
+│ └── Layer 31: 2 MB                                       │
+├──────────────────────────────────────────────────────────┤
+│ Value (k_or_v=1): 64 MB                                  │
+│ ├── Layer 0:  2 MB                                       │
+│ ├── ...                                                   │
+│ └── Layer 31: 2 MB                                       │
+└──────────────────────────────────────────────────────────┘
+```
+
+##### 一个 chunk 的数据从哪来？
+
+`key_value` 的一个 chunk（256 tokens）是从 vLLM 的分页 GPU 缓冲区中"聚集"而来的：
+
+```
+vLLM 的分页缓冲区（GPU）：
+  [num_blocks, block_size, NH, HS]  例如 [1024, 16, 32, 128]
+  物理上不连续——token 可能分散在不同 block 中
+
+slot_mapping: [0, 1, 2, ..., 15, 16, 17, ..., 31, ...]
+              block_0 的 16 个 token   block_1 的 16 个 token
+
+LMCache 的连续缓冲区（CPU 钉扎内存）：
+  [2, 32, 256, 4096]  256 个 token 连续排列
+  物理上完全连续——通过 CUDA 内核从分页缓冲区聚集而来
+```
+
+##### 与 vLLM 分页缓冲区的大小对比
+
+| 维度 | vLLM 分页缓冲区 | LMCache 连续缓冲区 |
+|------|----------------|-------------------|
+| 形状 | [NB, BS, NH, HS] 每层 | [2, NL, chunk_size, H] |
+| token 数 | NB × BS（整个 KV 池） | chunk_size（通常 256） |
+| 层数 | 每层独立张量 | 所有层在一个张量中 |
+| 连续性 | 物理上不连续（分页） | 物理上完全连续 |
+| 位置 | GPU 显存 | CPU 钉扎内存 |
+| 典型大小 | 数十 GB | 128 MB（Llama-7B） |
+
+##### 完整请求的 KV Cache 由多个 chunk 组成
+
+一个 1024 token 的请求在 LMCache 中被切分为 4 个 chunk：
+
+```
+请求: 1024 tokens
+  │
+  ├── Chunk 0: tokens[0:256]
+  │   key_value shape = [2, 32, 256, 4096], 128 MB
+  │   CacheEngineKey = CacheEngineKey("llama-7b", 1, 0, hash_0, fp16)
+  │
+  ├── Chunk 1: tokens[256:512]
+  │   key_value shape = [2, 32, 256, 4096], 128 MB
+  │   CacheEngineKey = CacheEngineKey("llama-7b", 1, 0, hash_1, fp16)
+  │
+  ├── Chunk 2: tokens[512:768]
+  │   key_value shape = [2, 32, 256, 4096], 128 MB
+  │   CacheEngineKey = CacheEngineKey("llama-7b", 1, 0, hash_2, fp16)
+  │
+  └── Chunk 3: tokens[768:1024]
+      key_value shape = [2, 32, 256, 4096], 128 MB
+      CacheEngineKey = CacheEngineKey("llama-7b", 1, 0, hash_3, fp16)
+
+每个 chunk 独立分配、独立传输、独立存储
+4 个 chunk 的 key_value 是 4 个独立的 MemoryObj，不共享内存
+```
+
+##### chunk_size 对性能的影响
+
+| chunk_size | 优点 | 缺点 |
+|-----------|------|------|
+| 128 | 内存粒度细，淘汰灵活 | 管理开销大，CUDA 内核启动次数多 |
+| **256（默认）** | 平衡点 | - |
+| 512 | 管理开销小 | 内存浪费（部分命中也需加载整块） |
+| 1024 | 内核效率高 | 内存浪费严重 |
+
+##### 昇腾适配的关键启示
+
+1. **`key_value` 是 chunk 级别的**，不是整个序列——这意味着昇腾只需要分配 chunk_size 大小的连续缓冲区
+2. **每个 chunk 独立传输**——可以逐 chunk 调用昇腾内核
+3. **连续缓冲区在 CPU 侧**——昇腾内核需要支持从 NPU 读取分页数据写入 CPU 连续缓冲区（或反过来）
+4. **chunk_size 通常为 256**——内核的 Grid.x 维度通常是 256
+
+#### A.6.9 `get_kernel_ptr`——主机/设备指针统一（第 467-484 行）
+
+**注意**：原 A.6.8 已上移为 A.6.8（key_value 连续内存布局），本节编号顺延。
 
 ```cpp
 template <typename T, typename TENSOR_TYPE>
